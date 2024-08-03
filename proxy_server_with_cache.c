@@ -17,6 +17,7 @@
 #include <time.h>
 
 #define MAX_CLIENTS 10
+#define MAX_BYTES (4096);
 
 typedef struct cache_element cache_element;
 
@@ -45,6 +46,264 @@ pthread_mutex_t lock; // mutex lock
 
 cache_element *head;
 int cache_size;
+
+
+
+
+// Connect Proxy Server to Backend/Remote Server
+int connectRemoteServer(char* host_addr, int port_num)
+{
+	// Creating Socket for proxy to remote server ---------------------------
+	int remoteSocket = socket(AF_INET, SOCK_STREAM, 0);
+
+	if( remoteSocket < 0)
+	{
+		printf("Error in Creating Socket.\n");
+		return -1;
+	}
+	
+	// Get host by the name or ip address provided
+
+	struct hostent *host = gethostbyname(host_addr);	
+	if(host == NULL)
+	{
+		fprintf(stderr, "No such host exists.\n");	 // standard error stream
+		return -1;
+	}
+
+	// inserts ip address and port number of host in struct `server_addr`
+	struct sockaddr_in server_addr;
+
+	bzero((char*)&server_addr, sizeof(server_addr)); // clear garbage values 
+	server_addr.sin_family = AF_INET;
+	server_addr.sin_port = htons(port_num);
+
+
+	bcopy((char *)host->h_addr,(char *)&server_addr.sin_addr.s_addr,host->h_length); // copy host ip address into server_addr
+
+	// Connect Proxy server to Remote server ----------------------------------------------------
+    // each connection requires a socket
+	if( connect(remoteSocket, (struct sockaddr*)&server_addr, (socklen_t)sizeof(server_addr)) < 0 )
+	{
+		fprintf(stderr, "Error in connecting !\n"); 
+		return -1;
+	}
+	// free(host_addr);
+	return remoteSocket;
+}
+
+
+
+
+
+int handle_request(int clientSocket, ParsedRequest *request, char *tempReq)
+{
+    char *buf = (char *)malloc(sizeof(char) * MAX_BYTES); // put GET request to buffer
+    strcpy(buf, "GET ");                                  // I have only Implemented GET requests
+    strcat(buf, request->path);
+    strcat(buf, " ");
+    strcat(buf, request->version);
+    strcat(buf, "\r\n");
+
+    size_t len = strlen(buf);
+
+    if (ParsedHeader_set(request, "Connection", "close") < 0) // setting Connection part of header to close , if <0 error encountered
+    {
+        printf("set header key not work\n"); // error in setting header
+    }
+
+    if (ParsedHeader_get(request, "Host") == NULL) // Checking if Header is set already
+    {
+        if (ParsedHeader_set(request, "Host", request->host) < 0)  // Setting Host part of header to request->Host
+        { 
+            printf("Set \"Host\" header key not working\n");// error in setting header
+        }
+    }
+
+    if (ParsedRequest_unparse_headers(request, buf + len, (size_t)MAX_BYTES - len) < 0) // Unparsing (Convert Back to Raw String data to be sent) and appending to  buffer contents 
+    { 
+        printf("unparse failed\n");
+        // return -1;				// If this happens Still try to send request without header
+    }
+
+    int server_port = 80; // Default Remote Server Port
+    if (request->port != NULL)
+        server_port = atoi(request->port);
+
+    int remoteSocketID = connectRemoteServer(request->host, server_port); // Connected to Remote server
+
+    if (remoteSocketID < 0)
+        return -1;
+
+    int bytes_send = send(remoteSocketID, buf, strlen(buf), 0);
+
+    bzero(buf, MAX_BYTES); // clear buffer 
+
+    bytes_send = recv(remoteSocketID, buf, MAX_BYTES - 1, 0); // recieve bytes into buffer 
+
+    char *temp_buffer = (char *)malloc(sizeof(char) * MAX_BYTES); // temp buffer
+    int temp_buffer_size = MAX_BYTES;
+    int temp_buffer_index = 0;
+
+    while (bytes_send > 0) // while keep  recieving bytes
+    {
+        bytes_send = send(clientSocket, buf, bytes_send, 0); // sending response of the request to the Client
+
+        for (int i = 0; i < bytes_send / sizeof(char); i++)
+        {
+            temp_buffer[temp_buffer_index] = buf[i];
+            // printf("%c",buf[i]); // Response Printing
+            temp_buffer_index++;
+        }
+        temp_buffer_size += MAX_BYTES;
+        temp_buffer = (char *)realloc(temp_buffer, temp_buffer_size); // C dosent have dynamic array , so i have to 2x the size of buffer every time its filled
+
+        if (bytes_send < 0)
+        {
+            perror("Error in sending data to client socket.\n");
+            break;
+        }
+        bzero(buf, MAX_BYTES);
+
+        bytes_send = recv(remoteSocketID, buf, MAX_BYTES - 1, 0);
+    }
+    temp_buffer[temp_buffer_index] = '\0';
+    free(buf); // we have to free the buffer array
+    add_cache_element(temp_buffer, strlen(temp_buffer), tempReq);
+    printf("Done\n");
+    free(temp_buffer);
+
+    close(remoteSocketID);
+    return 0;
+}
+
+void *thread_fn(void *socketNew) // init thread
+{
+    sem_wait(&seamaphore);
+    int p;
+    sem_getvalue(&seamaphore, &p);
+    printf("semaphore value:%d\n", p);
+    int *t = (int *)(socketNew);
+    int socket = *t;            // Socket is socket descriptor of the connected Client
+    int bytes_send_client, len; // Bytes Transferred
+
+    char *buffer = (char *)calloc(MAX_BYTES, sizeof(char)); // Creating buffer of 4kb for a client , To process Request 4kb at a time
+
+    bzero(buffer, MAX_BYTES);                               // Making buffer zero
+    bytes_send_client = recv(socket, buffer, MAX_BYTES, 0); // Receiving the Request from client
+
+    while (bytes_send_client > 0)
+    {
+        len = strlen(buffer);
+        // recieve loop until u find "\r\n\r\n"(ending of http request) in the buffer
+        if (strstr(buffer, "\r\n\r\n") == NULL)
+        {
+            bytes_send_client = recv(socket, buffer + len, MAX_BYTES - len, 0);
+        }
+        else
+        {
+            break;
+        }
+    }
+
+    // printf("--------------------------------------------\n");
+    // printf("%s\n",buffer);
+    // printf("----------------------%d----------------------\n",strlen(buffer));
+
+    char *tempReq = (char *)malloc(strlen(buffer) * sizeof(char) + 1);
+    // tempReq &  buffer both store the http request sent by client
+    for (int i = 0; i < strlen(buffer); i++)
+    {
+        tempReq[i] = buffer[i];
+    }
+
+    // checking if current  request is in cache
+    struct cache_element *temp = find(tempReq);
+
+    // Request is present is cache = Loop Linked list to get response from cache
+    if (temp != NULL)
+    {
+        // request found in cache, so sending the response to client from proxy's cache
+        int size = temp->len / sizeof(char); // Lenght of request
+        int pos = 0;
+        char response[MAX_BYTES];
+        while (pos < size)
+        {
+            bzero(response, MAX_BYTES);
+            for (int i = 0; i < MAX_BYTES; i++)
+            {
+                response[i] = temp->data[pos];
+                pos++;
+            }
+            send(socket, response, MAX_BYTES, 0);
+        }
+        printf("Data retrived from the Cache\n\n");
+        printf("%s\n\n", response);
+        // close(socketNew);
+        // sem_post(&seamaphore);
+        // return NULL;
+    }
+
+    // Not in LRU Cache , so treated as New Request
+    else if (bytes_send_client > 0)
+    {
+        len = strlen(buffer);
+        // Parsing the request
+        ParsedRequest *request = ParsedRequest_create(); // storing  the buffer in this parsed request variable
+
+        // ParsedRequest_parse returns 0 on success and -1 on failure.On success it stores parsed request in
+        //  the request
+        if (ParsedRequest_parse(request, buffer, len) < 0)
+        {
+            printf("Parsing failed\n");
+        }
+        else
+        {
+            bzero(buffer, MAX_BYTES);
+            if (!strcmp(request->method, "GET")) // its a GET
+            {
+
+                if (request->host && request->path && (checkHTTPversion(request->version) == 1)) // only HTTP version 1.0 supported by this lib
+                {
+                    bytes_send_client = handle_request(socket, request, tempReq); // Handle GET request
+                    if (bytes_send_client == -1)
+                    {
+                        sendErrorMessage(socket, 500);
+                    }
+                }
+                else
+                    sendErrorMessage(socket, 500); // 500 Internal Error
+            }
+            else
+            {
+                printf("This code doesn't support any method other than GET\n");
+            }
+        }
+        // freeing up the request pointer
+        ParsedRequest_destroy(request);
+    }
+    // corrupted send from client
+    else if (bytes_send_client < 0)
+    {
+        perror("Error in receiving from client.\n");
+    }
+    // no request from client
+    else if (bytes_send_client == 0)
+    {
+        printf("Client disconnected!\n");
+    }
+    // close socket
+    shutdown(socket, SHUT_RDWR);
+    close(socket);
+    free(buffer); // buffer stores both incoming request or response during the processing time
+
+    sem_post(&seamaphore);
+    sem_getvalue(&seamaphore, &p);
+    printf("Semaphore post value:%d\n", p);
+
+    free(tempReq);
+    return NULL;
+}
 
 int main(int argc, char *argv[])
 {
@@ -100,10 +359,8 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-
-    int i=0;
+    int i = 0;
     int Connected_socketid[MAX_CLIENTS];
-
 
     // continuously check for client requests
     while (1)
@@ -130,16 +387,12 @@ int main(int argc, char *argv[])
         char str[INET_ADDRSTRLEN];                          // INET_ADDRSTRLEN: Default ip address size
         inet_ntop(AF_INET, &ip_addr, str, INET_ADDRSTRLEN); // convert ipaddr to standard readable format
         printf("Client is connected with port number: %d and ip address: %s \n", ntohs(client_addr.sin_port), str);
-        //printf("Socket values of index %d in main function is %d\n",i, client_socketId);
-		
-        
-        
-        pthread_create(&tid[i],NULL,thread_fn, (void*)&Connected_socketId[i]); // Creating a thread for each client accepted
-		// This Thread is responsible for handling request and response for the its client
-		i++; 
-         
+        // printf("Socket values of index %d in main function is %d\n",i, client_socketId);
+
+        pthread_create(&tid[i], NULL, thread_fn, (void *)&Connected_socketId[i]); // Creating a thread for each client accepted
+        // This Thread is responsible for handling request and response for the its client
+        i++;
     }
-    close(proxy_socketId);									// Close socket
- 	return 0;
-    
+    close(proxy_socketId); // Close socket
+    return 0;
 }
